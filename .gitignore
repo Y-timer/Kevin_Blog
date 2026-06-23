@@ -26,3 +26,5 @@ backend/uploads/
 Thumbs.db
 .idea/
 .vscode/
+
+.prettier*
