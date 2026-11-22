@@ -46,9 +46,11 @@ build_in() (
 )
 
 check_clean() {
-  local status flags
-  status=$(git_project status --porcelain=v1 --untracked-files=all)
-  [[ -z $status ]] || fail 'Git 有未提交或未跟踪的文件。请先检查并保留本地修改。'
+  local status untracked flags
+  status=$(git_project status --porcelain=v1 --untracked-files=no)
+  # 首次接管时旧提交还没有忽略 .deploy，部署脚本会先在这里加锁。
+  untracked=$(git_project ls-files --others --exclude-standard -- . ':(top,exclude).deploy')
+  [[ -z $status && -z $untracked ]] || fail 'Git 有未提交或未跟踪的文件。请先检查并保留本地修改。'
   flags=$(git_project ls-files -v)
   if [[ $flags =~ (^|$'\n')[a-zS]\  ]]; then
     fail 'Git 索引有 assume-unchanged 或 skip-worktree 标记，请先检查。'
