@@ -1,8 +1,9 @@
+import { Prisma } from '@prisma/client';
 import prisma from '../config/prisma';
 import { slugify } from '../utils/slug';
 
 const postInclude = {
-  author: { select: { id: true, username: true, avatar: true } },
+  author: { select: { id: true, username: true, avatar: true, bio: true } },
   category: true,
   tags: { include: { tag: true } },
 };
@@ -19,14 +20,14 @@ export class PostService {
     const { page = 1, pageSize = 10, categoryId, tagId, search, published } = params;
     const skip = (page - 1) * pageSize;
 
-    const where: any = {};
+    const where: Prisma.PostWhereInput = {};
     if (published !== undefined) where.published = published;
     if (categoryId) where.categoryId = categoryId;
     if (tagId) where.tags = { some: { tagId } };
     if (search) {
       where.OR = [
-        { title: { contains: search, mode: 'insensitive' } },
-        { content: { contains: search, mode: 'insensitive' } },
+        { title: { contains: search } },
+        { content: { contains: search } },
       ];
     }
 
@@ -36,7 +37,7 @@ export class PostService {
         include: postInclude,
         skip,
         take: pageSize,
-        orderBy: { createdAt: 'desc' },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       }),
       prisma.post.count({ where }),
     ]);
@@ -56,19 +57,26 @@ export class PostService {
   }
 
   async findBySlug(slug: string) {
-    const post = await prisma.post.findUnique({
-      where: { slug },
+    // 计入浏览量时保留正文的更新时间，供编辑器判断本地草稿是否过期。
+    const updated = await prisma.$executeRaw`
+      UPDATE posts SET views = views + 1 WHERE slug = ${slug} AND published = true
+    `;
+    if (!updated) return null;
+    const post = await prisma.post.findFirst({
+      where: { slug, published: true },
       include: postInclude,
     });
-    if (!post) throw new Error('文章不存在');
-
-    await prisma.post.update({ where: { id: post.id }, data: { views: { increment: 1 } } });
+    if (!post) return null;
 
     return {
       ...post,
-      views: post.views + 1,
       tags: post.tags.map((pt) => pt.tag),
     };
+  }
+
+  async findForEdit(slug: string, authorId: string) {
+    const post = await prisma.post.findFirst({ where: { slug, authorId }, include: postInclude });
+    return post && { ...post, tags: post.tags.map(({ tag }) => tag) };
   }
 
   async create(data: {
@@ -91,7 +99,7 @@ export class PostService {
         published: data.published ?? true,
         categoryId: data.categoryId,
         authorId: data.authorId,
-        tags: data.tagIds?.length ? { create: data.tagIds.map((tagId) => ({ tagId })) } : undefined,
+        tags: data.tagIds?.length ? { create: [...new Set(data.tagIds)].map((tagId) => ({ tagId })) } : undefined,
       },
       include: postInclude,
     });
@@ -108,7 +116,7 @@ export class PostService {
       excerpt?: string;
       coverImage?: string;
       published?: boolean;
-      categoryId?: string;
+      categoryId?: string | null;
       tagIds?: string[];
     },
   ) {
@@ -116,19 +124,20 @@ export class PostService {
     if (!post) throw new Error('文章不存在');
     if (post.authorId !== authorId) throw new Error('无权编辑此文章');
 
-    if (data.tagIds) {
-      await prisma.postTag.deleteMany({ where: { postId: id } });
-    }
-
-    const updateData: any = { ...data };
-    if (data.title) updateData.slug = slugify(data.title);
-    delete updateData.tagIds;
-
+    const { tagIds, ...fields } = data;
+    const uniqueTagIds = tagIds && [...new Set(tagIds)];
     const updated = await prisma.post.update({
       where: { id },
       data: {
-        ...updateData,
-        tags: data.tagIds?.length ? { create: data.tagIds.map((tagId) => ({ tagId })) } : undefined,
+        ...fields,
+        tags: uniqueTagIds && {
+          deleteMany: uniqueTagIds.length ? { tagId: { notIn: uniqueTagIds } } : {},
+          upsert: uniqueTagIds.map((tagId) => ({
+            where: { postId_tagId: { postId: id, tagId } },
+            create: { tagId },
+            update: {},
+          })),
+        },
       },
       include: postInclude,
     });
@@ -137,11 +146,23 @@ export class PostService {
   }
 
   async getNeighbors(slug: string) {
-    const current = await prisma.post.findUnique({ where: { slug }, select: { id: true, createdAt: true } });
-    if (!current) throw new Error('文章不存在');
+    const current = await prisma.post.findFirst({
+      where: { slug, published: true },
+      select: { id: true, createdAt: true },
+    });
+    if (!current) return null;
+    const { id, createdAt } = current;
     const [prev, next] = await Promise.all([
-      prisma.post.findFirst({ where: { published: true, createdAt: { lt: current.createdAt } }, orderBy: { createdAt: 'desc' }, select: { title: true, slug: true } }),
-      prisma.post.findFirst({ where: { published: true, createdAt: { gt: current.createdAt } }, orderBy: { createdAt: 'asc' }, select: { title: true, slug: true } }),
+      prisma.post.findFirst({
+        where: { published: true, OR: [{ createdAt: { lt: createdAt } }, { createdAt, id: { lt: id } }] },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        select: { title: true, slug: true },
+      }),
+      prisma.post.findFirst({
+        where: { published: true, OR: [{ createdAt: { gt: createdAt } }, { createdAt, id: { gt: id } }] },
+        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+        select: { title: true, slug: true },
+      }),
     ]);
     return { prev: prev || null, next: next || null };
   }

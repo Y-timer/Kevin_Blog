@@ -43,19 +43,9 @@ app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Ensure password_resets and images tables exist
-(async () => {
+// 本地开发可自动建表，生产启动只使用已有表。
+async function initDevelopmentTables() {
   try {
-    await prisma.$executeRawUnsafe(`
-      CREATE TABLE IF NOT EXISTS password_resets (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        token VARCHAR(255) NOT NULL,
-        user_id VARCHAR(36) NOT NULL,
-        expires_at DATETIME NOT NULL,
-        INDEX idx_token (token),
-        INDEX idx_user_id (user_id)
-      )
-    `);
     await prisma.$executeRawUnsafe(`
       CREATE TABLE IF NOT EXISTS images (
         id VARCHAR(36) PRIMARY KEY,
@@ -68,7 +58,11 @@ app.get('/api/health', (_req, res) => {
       )
     `);
   } catch {}
-})();
+}
+
+if (config.nodeEnv !== 'production') {
+  void initDevelopmentTables();
+}
 
 // API routes
 app.use('/api', routes);

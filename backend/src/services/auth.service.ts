@@ -55,64 +55,32 @@ export class AuthService {
   }
 
   /**
-   * 刷新 Token：验证旧 refreshToken → 删除旧记录 → 签发新双 Token
+   * 刷新 Token：验证旧 refreshToken，匹配旧记录后原子替换
    * 采用"滚动刷新"策略——每次使用后旧 Token 立即失效，防止被窃取后重复使用
    */
   async refreshToken(refreshToken: string) {
     const payload = verifyRefreshToken(refreshToken);
-    // 数据库中存的是 token 的哈希值，查找时需先哈希
-    const stored = await prisma.refreshToken.findUnique({ where: { token: hashToken(refreshToken) } });
-    if (!stored) throw new Error('刷新令牌无效');
+    const token = hashToken(refreshToken);
+    const stored = await prisma.refreshToken.findUnique({
+      where: { token },
+    });
+    if (!stored || stored.userId !== payload.userId) throw new Error('刷新令牌无效');
+    const user = await prisma.user.findUnique({ where: { id: stored.userId }, select: { role: true } });
+    if (!user) throw new Error('刷新令牌无效');
 
-    // 一次性使用：删除旧 token，签发新 token
-    await prisma.refreshToken.delete({ where: { id: stored.id } });
-
-    const tokens = this.generateTokens({ userId: payload.userId, role: payload.role });
-    await this.storeRefreshToken(payload.userId, tokens.refreshToken);
+    const tokens = this.generateTokens({ userId: stored.userId, role: user.role });
+    const { exp } = verifyRefreshToken(tokens.refreshToken);
+    const { count } = await prisma.refreshToken.updateMany({
+      where: { id: stored.id, token, expiresAt: { gt: new Date() } },
+      data: { token: hashToken(tokens.refreshToken), expiresAt: new Date(exp * 1000) },
+    });
+    if (count !== 1) throw new Error('刷新令牌无效');
 
     return tokens;
   }
 
   async logout(refreshToken: string) {
     await prisma.refreshToken.deleteMany({ where: { token: hashToken(refreshToken) } });
-  }
-
-  /**
-   * 忘记密码——生成一次性重置 token，有效期 30 分钟
-   * 使用 crypto.randomBytes 生成 32 字节随机 token（64 位十六进制）
-   * 直接操作 password_resets 表（该表未在 Prisma schema 中定义 model，由应用启动时自动建表）
-   */
-  async forgotPassword(email: string) {
-    const user = await prisma.user.findUnique({ where: { email } });
-    if (!user) throw new Error('该邮箱未注册');
-    const token = crypto.randomBytes(32).toString('hex');
-    const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
-    await prisma.$executeRawUnsafe(`INSERT INTO password_resets (token, user_id, expires_at) VALUES (?, ?, ?)`, [
-      token,
-      user.id,
-      expiresAt,
-    ]);
-    return { token, email };
-  }
-
-  /**
-   * 重置密码：验证 token 有效性 → 检查是否过期 → 更新密码 → 删除已用 token
-   */
-  async resetPassword(token: string, newPassword: string) {
-    const rows = await prisma.$queryRawUnsafe<any[]>(
-      `SELECT user_id, expires_at FROM password_resets WHERE token = ? LIMIT 1`,
-      [token],
-    );
-    if (!rows.length) throw new Error('无效的重置链接');
-    const row = rows[0];
-    if (new Date(row.expires_at) > new Date()) {
-      const hashed = await bcrypt.hash(newPassword, 12);
-      await prisma.user.update({ where: { id: row.user_id }, data: { password: hashed } });
-      await prisma.$executeRawUnsafe(`DELETE FROM password_resets WHERE token = ?`, [token]);
-    } else {
-      await prisma.$executeRawUnsafe(`DELETE FROM password_resets WHERE token = ?`, [token]);
-      throw new Error('重置链接已过期');
-    }
   }
 
   // OAuth 登录：邮箱已存在 → 直接签发 Token；不存在 → 自动注册
@@ -186,7 +154,7 @@ export class AuthService {
   /** 获取用户的收藏文章列表，取出关联的 post 并含作者/分类/标签信息 */
   async getUserFavorites(userId: string) {
     const favs = await prisma.favorite.findMany({
-      where: { userId },
+      where: { userId, post: { published: true } },
       include: {
         post: {
           include: {
@@ -219,7 +187,7 @@ export class AuthService {
   private async storeRefreshToken(userId: string, token: string) {
     const decoded = verifyRefreshToken(token);
     // JWT payload 中的 exp 是秒级 Unix 时间戳，需转换为毫秒
-    const expiresAt = new Date((decoded as any).exp! * 1000);
+    const expiresAt = new Date(decoded.exp * 1000);
 
     await prisma.refreshToken.create({
       data: { token: hashToken(token), userId, expiresAt },

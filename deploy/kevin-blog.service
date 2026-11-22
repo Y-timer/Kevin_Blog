@@ -1,0 +1,27 @@
+[Unit]
+Description=Kevin Blog API
+After=network.target
+
+[Service]
+Type=exec
+User=kevin-blog
+Group=kevin-blog
+WorkingDirectory=/www/wwwroot/Kevin_Blog/backend
+Environment=NODE_ENV=production
+Environment=PORT=3001
+Environment=PATH=/www/server/nodejs/v22.22.2/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env node dist/index.js
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=15s
+StandardOutput=journal
+StandardError=journal
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/www/wwwroot/Kevin_Blog/backend/uploads
+
+[Install]
+WantedBy=multi-user.target

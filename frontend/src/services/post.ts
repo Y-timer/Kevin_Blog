@@ -28,6 +28,11 @@ export async function getPostBySlug(slug: string): Promise<Post> {
   return res.data.data;
 }
 
+export async function getPostForEdit(slug: string): Promise<Post> {
+  const res = await api.get(`/posts/${encodeURIComponent(slug)}/edit`);
+  return res.data.data;
+}
+
 /** 创建文章 */
 export async function createPost(data: {
   title: string;
@@ -42,14 +47,14 @@ export async function createPost(data: {
 }
 
 /** 获取文章评论（分页） */
-export async function getComments(postId: string, page = 1): Promise<{ data: Comment[]; pagination: Pagination }> {
-  const res = await api.get(`/comments/post/${postId}`, { params: { page } });
+export async function getComments(postId: string, page = 1, signal?: AbortSignal): Promise<{ data: Comment[]; pagination: Pagination }> {
+  const res = await api.get(`/comments/post/${postId}`, { params: { page }, signal });
   return res.data;
 }
 
 /** 发表评论 */
-export async function createComment(postId: string, content: string): Promise<Comment> {
-  const res = await api.post(`/comments/post/${postId}`, { content });
+export async function createComment(postId: string, content: string, parentId?: string): Promise<Comment> {
+  const res = await api.post(`/comments/post/${postId}`, { content, parentId });
   return res.data.data;
 }
 

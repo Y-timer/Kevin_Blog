@@ -44,8 +44,9 @@ export default function UserCenterPage() {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const authLogout = useAuthStore((s) => s.logout);
+  const accountId = useAuthStore((s) => s.user?.id);
 
-  const { data: user } = useQuery({ queryKey: ['me'], queryFn: getMe, staleTime: 30 * 1000 });
+  const { data: user } = useQuery({ queryKey: ['me', accountId], queryFn: getMe, enabled: !!accountId, staleTime: 30 * 1000 });
 
   const profileForm = useForm<ProfileForm>({
     resolver: zodResolver(profileSchema),
@@ -54,21 +55,21 @@ export default function UserCenterPage() {
   const passwordForm = useForm<PasswordForm>({ resolver: zodResolver(passwordSchema) });
 
   const postsQuery = useQuery({
-    queryKey: ['my-posts'],
+    queryKey: ['my-posts', accountId],
     queryFn: async () => {
       const r = await api.get<{ data: Post[] }>('/auth/posts');
       return r.data.data;
     },
-    enabled: activeTab === 'posts',
+    enabled: !!accountId && activeTab === 'posts',
   });
 
   const favoritesQuery = useQuery({
-    queryKey: ['my-favorites'],
+    queryKey: ['my-favorites', accountId],
     queryFn: async () => {
       const r = await api.get<{ data: Post[] }>('/auth/favorites');
       return r.data.data;
     },
-    enabled: activeTab === 'favorites',
+    enabled: !!accountId && activeTab === 'favorites',
   });
 
   const profileMut = useMutation({
@@ -260,7 +261,7 @@ export default function UserCenterPage() {
                   {postsQuery.data?.map((post) => (
                     <Link
                       key={post.id}
-                      to={`/post/${post.slug}`}
+                      to={`/${post.published ? 'post' : 'editor'}/${post.slug}`}
                       className="card group flex items-center justify-between p-4 transition-all hover:border-[rgba(0,229,255,0.2)] hover:bg-[#1a1a28]"
                     >
                       <div>

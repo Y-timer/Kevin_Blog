@@ -1,17 +1,18 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
+import { useQueryClient } from '@tanstack/react-query';
 import ParticleBackground from '../components/layout/ParticleBackground';
 import Footer from '../components/layout/Footer';
 import ScrollToTop from '../components/layout/ScrollToTop';
 import MarkdownRenderer from '../components/article/MarkdownRenderer';
-import { createPost, getPostBySlug, getCategories } from '../services/post';
+import { createPost, getPostForEdit, getCategories } from '../services/post';
 import { getAssetUrl, uploadImage } from '../services/upload';
 import api from '../services/api';
-import type { Category, Tag } from '../types';
+import type { Category, Post, Tag } from '../types';
 import { getApiErrorMessage } from '../utils/errors';
 
 const catOptions = [
-  { value: '', label: '选择分类...' },
+  { value: '', label: '未分类' },
   { value: 'AI & ML', label: 'AI & ML' },
   { value: 'Web 开发', label: 'Web 开发' },
   { value: '安全攻防', label: '安全攻防' },
@@ -49,101 +50,120 @@ function estimateReadTime(text: string): number {
 
 export default function EditorPage() {
   const { slug } = useParams<{ slug?: string }>();
+  return <Editor key={slug ?? 'new'} slug={slug} />;
+}
+
+function readDraft(key: string): EditorDraft | undefined {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return undefined;
+    const draft = JSON.parse(raw) as EditorDraft | null;
+    if (draft?.tags && !Array.isArray(draft.tags)) return undefined;
+    return draft ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function Editor({ slug }: { slug?: string }) {
   const isEditing = !!slug; // 有 slug → 编辑模式，无 slug → 新建模式
+  const draftKey = slug ? `nexuslog_draft:${slug}` : 'nexuslog_draft';
+  const [initialDraft] = useState(() => slug ? undefined : readDraft(draftKey));
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const [editPostId, setEditPostId] = useState<string | null>(null); // 编辑时的文章 UUID
   const [catNameToId, setCatNameToId] = useState<Record<string, string>>({}); // 分类名→ID 映射
   const [tagNameToId, setTagNameToId] = useState<Record<string, string>>({}); // 标签名→ID 映射
-  const [title, setTitle] = useState('');
-  const [category, setCategory] = useState('');
-  const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
-  const [tags, setTags] = useState<string[]>([]);
+  const [title, setTitle] = useState(initialDraft?.title ?? '');
+  const [category, setCategory] = useState(initialDraft?.category ?? '');
+  const [date, setDate] = useState(initialDraft?.date ?? new Date().toISOString().slice(0, 10));
+  const [tags, setTags] = useState<string[]>(initialDraft?.tags ?? []);
   const [tagInput, setTagInput] = useState('');
-  const [excerpt, setExcerpt] = useState('');
-  const [content, setContent] = useState('');
-  const [saveStatus, setSaveStatus] = useState<'ready' | 'saved' | 'saving' | 'published'>('ready');
-  const [lastSaved, setLastSaved] = useState('');
+  const [excerpt, setExcerpt] = useState(initialDraft?.excerpt ?? '');
+  const [content, setContent] = useState(initialDraft?.content ?? '');
+  const [lastSaved, setLastSaved] = useState(initialDraft?.savedAt ? new Date(initialDraft.savedAt).toLocaleString('zh-CN') : '');
   const [toastMsg, setToastMsg] = useState('');
   const [toastVisible, setToastVisible] = useState(false);
   const [mobileShowPreview, setMobileShowPreview] = useState(false);
   const [scrolled, setScrolled] = useState(false);
   const [publishing, setPublishing] = useState(false);
+  const [loadError, setLoadError] = useState('');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const mdFileRef = useRef<HTMLInputElement>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const draftTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const editReady = !isEditing || editPostId !== null;
+  const draftContent = JSON.stringify({ title, category, date, tags, excerpt, content });
+  const lastDraftContent = useRef(draftContent);
+  const categoryOptions = [...new Set([...catOptions.map(({ value }) => value), ...Object.keys(catNameToId), category])];
 
   const words = countWords(content);
   const chars = content.length;
   const readMin = estimateReadTime(content);
 
-  const showToast = (msg: string) => {
+  const showToast = useCallback((msg: string) => {
     setToastMsg(msg);
     setToastVisible(true);
-    if (toastTimer.current) clearTimeout(toastTimer.current as unknown as number);
+    if (toastTimer.current) clearTimeout(toastTimer.current);
     toastTimer.current = setTimeout(() => setToastVisible(false), 2500);
-  };
+  }, []);
 
-  const saveDraft = useCallback(() => {
-    const draft = { title, category, date, tags, excerpt, content, savedAt: new Date().toISOString() };
-    localStorage.setItem('nexuslog_draft', JSON.stringify(draft));
-    setSaveStatus('saved');
-    setLastSaved(new Date().toLocaleTimeString('zh-CN'));
-    showToast('✓ 草稿已保存 (Ctrl+S)');
-  }, [title, category, date, tags, excerpt, content]);
+  useEffect(() => () => {
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+  }, []);
+
+  const saveDraft = useCallback((manual = false) => {
+    if (!editReady || publishing) return;
+    if (!manual && lastDraftContent.current === draftContent) return;
+    const now = new Date();
+    try {
+      localStorage.setItem(draftKey, JSON.stringify({ ...JSON.parse(draftContent), savedAt: now.toISOString() }));
+      lastDraftContent.current = draftContent;
+      setLastSaved(now.toLocaleTimeString('zh-CN'));
+      if (manual) showToast('✓ 草稿已保存 (Ctrl+S)');
+    } catch {
+      showToast('✗ 无法保存本地草稿，请检查浏览器存储空间');
+    }
+  }, [draftContent, draftKey, editReady, publishing, showToast]);
 
   // Edit mode: load existing article data from API
   useEffect(() => {
     if (!slug) return;
-    getPostBySlug(slug)
+    let active = true;
+    getPostForEdit(slug)
       .then((post) => {
+        if (!active) return;
+        const draft = readDraft(draftKey);
+        const restored = draft?.savedAt && Date.parse(draft.savedAt) > Date.parse(post.updatedAt) ? draft : undefined;
+        const fields = {
+          title: restored?.title ?? post.title,
+          category: restored?.category ?? post.category?.name ?? '',
+          date: post.createdAt.slice(0, 10),
+          tags: restored?.tags ?? post.tags?.map((tag) => tag.name) ?? [],
+          excerpt: restored?.excerpt ?? post.excerpt ?? '',
+          content: restored?.content ?? post.content,
+        };
+        lastDraftContent.current = JSON.stringify(fields);
         setEditPostId(post.id);
-        setTitle(post.title);
-        setContent(post.content);
-        if (post.excerpt) setExcerpt(post.excerpt);
-        if (post.category?.name) setCategory(post.category.name);
-        if (post.createdAt) setDate(post.createdAt.slice(0, 10));
-        if (post.tags?.length) setTags(post.tags.map((t) => t.name));
-        setSaveStatus('ready');
+        setTitle(fields.title);
+        setContent(fields.content);
+        setExcerpt(fields.excerpt);
+        setCategory(fields.category);
+        setDate(fields.date);
+        setTags(fields.tags);
+        if (restored) {
+          setLastSaved(new Date(restored.savedAt!).toLocaleString('zh-CN'));
+        }
       })
       .catch(() => {
-        showToast('✗ 文章加载失败');
+        if (active) setLoadError('文章加载失败，请确认你有编辑权限后重试');
       });
-  }, [slug]);
+    return () => { active = false; };
+  }, [draftKey, slug]);
 
-  // Load draft on mount (new mode only)
   useEffect(() => {
-    if (isEditing) return;
-    try {
-      const raw = localStorage.getItem('nexuslog_draft');
-      if (raw) {
-        const d = JSON.parse(raw) as EditorDraft;
-        if (d.title) setTitle(d.title);
-        if (d.category) setCategory(d.category);
-        if (d.date) setDate(d.date);
-        if (Array.isArray(d.tags)) setTags(d.tags);
-        if (d.content) setContent(d.content);
-        if (d.excerpt) setExcerpt(d.excerpt);
-        if (d.savedAt) setLastSaved(new Date(d.savedAt).toLocaleString('zh-CN'));
-        setSaveStatus('ready');
-      }
-    } catch {
-      localStorage.removeItem('nexuslog_draft');
-    }
-  }, [isEditing]);
-
-  // Auto-save draft every 30s
-  useEffect(() => {
-    draftTimer.current = setInterval(() => {
-      const draft = { title, category, date, tags, excerpt, content, savedAt: new Date().toISOString() };
-      localStorage.setItem('nexuslog_draft', JSON.stringify(draft));
-      setSaveStatus('saved');
-      setLastSaved(new Date().toLocaleTimeString('zh-CN'));
-    }, 30000);
-    return () => {
-      if (draftTimer.current) clearInterval(draftTimer.current as unknown as number);
-    };
-  }, [title, category, date, tags, excerpt, content]);
+    const timer = setTimeout(saveDraft, 30_000);
+    return () => clearTimeout(timer);
+  }, [saveDraft]);
 
   // 加载分类和标签列表，建 name → id 映射
   useEffect(() => {
@@ -185,7 +205,7 @@ export default function EditorPage() {
     const handler = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === 's') {
         e.preventDefault();
-        saveDraft();
+        saveDraft(true);
       }
     };
     window.addEventListener('keydown', handler);
@@ -196,14 +216,9 @@ export default function EditorPage() {
   const resolveCategoryId = async (): Promise<string | undefined> => {
     if (!category) return undefined;
     if (catNameToId[category]) return catNameToId[category];
-    try {
-      const r = await api.post('/categories', { name: category });
-      const newId = r.data.data.id;
-      setCatNameToId((p) => ({ ...p, [category]: newId }));
-      return newId;
-    } catch {
-      return undefined;
-    }
+    const { data } = await api.post<{ data: Category }>('/categories', { name: category });
+    setCatNameToId((previous) => ({ ...previous, [category]: data.data.id }));
+    return data.data.id;
   };
 
   // 将用户输入的标签名转为 tagIds（已有标签用ID，新标签先创建再返回ID）
@@ -214,19 +229,15 @@ export default function EditorPage() {
         ids.push(tagNameToId[name]);
         continue;
       }
-      try {
-        const r = await api.post('/tags', { name });
-        const nid = r.data.data.id;
-        setTagNameToId((p) => ({ ...p, [name]: nid }));
-        ids.push(nid);
-      } catch {
-        continue;
-      }
+      const { data } = await api.post<{ data: Tag }>('/tags', { name });
+      setTagNameToId((previous) => ({ ...previous, [name]: data.data.id }));
+      ids.push(data.data.id);
     }
     return ids;
   };
 
   const handlePublish = async () => {
+    if (!editReady || publishing) return;
     if (!title.trim()) {
       showToast('✗ 请先输入文章标题');
       return;
@@ -256,30 +267,21 @@ export default function EditorPage() {
       const catId = await resolveCategoryId(); // 自动创建不存在的分类
       const tagIds = await resolveTagIds();
 
-      if (isEditing && slug) {
-        await api.put(`/posts/${editPostId}`, {
-          title: title.trim(),
-          content,
-          excerpt: finalExcerpt,
-          categoryId: catId,
-          tagIds,
-        });
-        setSaveStatus('published');
-        showToast('✓ 文章更新成功！');
-        setTimeout(() => navigate(`/post/${slug}`), 800);
-      } else {
-        const post = await createPost({
-          title: title.trim(),
-          content,
-          excerpt: finalExcerpt,
-          categoryId: catId,
-          tagIds,
-        });
-        localStorage.removeItem('nexuslog_draft');
-        setSaveStatus('published');
-        showToast('✓ 文章发布成功！');
-        setTimeout(() => navigate(`/post/${post.slug}`), 800);
+      const fields = { title: title.trim(), content, excerpt: finalExcerpt, tagIds };
+      const post = editPostId
+        ? (await api.put<{ data: Post }>(`/posts/${editPostId}`, { ...fields, categoryId: catId ?? null })).data.data
+        : await createPost({ ...fields, categoryId: catId });
+      lastDraftContent.current = draftContent;
+      try {
+        localStorage.removeItem(draftKey);
+      } catch {
+        // 文章已保存。浏览器阻止清理本地草稿时仍然跳转。
       }
+      if (post.published) queryClient.setQueryData(['post', post.slug], post);
+      for (const key of ['posts', 'recentPosts', 'related', 'neighbors', 'stats', 'my-posts', 'categories', 'tags']) {
+        void queryClient.invalidateQueries({ queryKey: [key] });
+      }
+      navigate(post.published ? `/post/${post.slug}` : '/user/center');
     } catch (err) {
       showToast('✗ ' + getApiErrorMessage(err, '发布失败'));
     } finally {
@@ -363,7 +365,6 @@ export default function EditorPage() {
     e.target.value = ''; // 允许重复导入同一文件
   };
 
-  const statusColor = saveStatus === 'published' ? '#b44dff' : saveStatus === 'saved' ? '#00ff88' : '#00ff88';
 
   return (
     <div style={{ minHeight: '100vh', position: 'relative', zIndex: 1 }}>
@@ -431,7 +432,8 @@ export default function EditorPage() {
                 &#128194; 导入 MD
               </button>
               <button
-                onClick={saveDraft}
+                onClick={() => saveDraft(true)}
+                disabled={!editReady || publishing}
                 className="inline-flex cursor-pointer items-center gap-1.5 rounded-[20px] border border-[rgba(255,109,58,0.3)] bg-transparent px-[18px] py-2 text-[0.85rem] font-semibold text-[#ff6d3a] transition-all hover:border-[#ff6d3a] hover:bg-[rgba(255,109,58,0.08)] hover:shadow-[0_0_12px_rgba(255,109,58,0.1)]"
                 style={{ fontFamily: 'inherit' }}
               >
@@ -449,7 +451,7 @@ export default function EditorPage() {
               </button>
               <button
                 onClick={handlePublish}
-                disabled={publishing}
+                disabled={!editReady || publishing}
                 className="inline-flex cursor-pointer items-center gap-1.5 rounded-[20px] border-none px-[18px] py-2 text-[0.85rem] font-bold text-white transition-all hover:-translate-y-px hover:shadow-[0_0_20px_rgba(0,229,255,0.3),0_0_40px_rgba(180,77,255,0.15)] disabled:opacity-60"
                 style={{ fontFamily: 'inherit', background: 'linear-gradient(135deg, #00e5ff, #b44dff)' }}
               >
@@ -459,8 +461,10 @@ export default function EditorPage() {
           </div>
 
           {/* Editor Body: Split Panes */}
-          <div
-            className="mb-5 grid flex-1 grid-cols-1 gap-5 lg:grid-cols-2"
+          {!editReady && <p role={loadError ? 'alert' : 'status'} className="pb-4 text-sm">{loadError || '正在加载文章…'}</p>}
+          <fieldset
+            disabled={!editReady || publishing}
+            className="mb-5 grid min-w-0 flex-1 grid-cols-1 gap-5 lg:grid-cols-2"
             style={{ minHeight: 'calc(100vh - 320px)' }}
           >
             {/* Left: Editor Pane */}
@@ -516,9 +520,9 @@ export default function EditorPage() {
                         backgroundPosition: 'right 14px center',
                       }}
                     >
-                      {catOptions.map((o) => (
-                        <option key={o.value} value={o.value} style={{ background: '#111118', color: '#e0e0e8' }}>
-                          {o.label}
+                      {categoryOptions.map((name) => (
+                        <option key={name} value={name} style={{ background: '#111118', color: '#e0e0e8' }}>
+                          {name || '未分类'}
                         </option>
                       ))}
                     </select>
@@ -528,12 +532,12 @@ export default function EditorPage() {
                       className="text-[0.78rem] font-semibold tracking-[1px] text-[#606078] uppercase"
                       style={{ fontFamily: 'var(--font-mono)' }}
                     >
-                      日期
+                      创建日期
                     </label>
                     <input
                       type="date"
                       value={date}
-                      onChange={(e) => setDate(e.target.value)}
+                      readOnly
                       className="w-full rounded-lg border border-[rgba(255,255,255,0.06)] bg-[#111118] px-4 py-2.5 text-[0.95rem] text-[#e0e0e8] transition-all outline-none focus:border-[#00e5ff] focus:shadow-[0_0_12px_rgba(0,229,255,0.12)]"
                     />
                   </div>
@@ -771,7 +775,7 @@ export default function EditorPage() {
                 )}
               </div>
             </div>
-          </div>
+          </fieldset>
 
           {/* Status Bar */}
           <div
@@ -782,9 +786,9 @@ export default function EditorPage() {
               <span className="flex items-center gap-1.5">
                 <span
                   className="h-1.5 w-1.5 rounded-full"
-                  style={{ background: statusColor, boxShadow: `0 0 6px ${statusColor}` }}
+                  style={{ background: '#00ff88', boxShadow: '0 0 6px #00ff88' }}
                 />
-                <span>{saveStatus === 'published' ? '已发布' : saveStatus === 'saved' ? '已保存' : '已就绪'}</span>
+                <span>{lastSaved ? '草稿已保存' : '已就绪'}</span>
               </span>
               <span>字数: {words}</span>
               <span>字符: {chars}</span>

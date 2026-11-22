@@ -1,56 +1,75 @@
-import axios from 'axios';
+import axios, { type InternalAxiosRequestConfig } from 'axios';
+import { useAuthStore } from '../store/authStore';
 
-/**
- * Axios 实例 —— 全局 API 请求配置
- *
- * 关键机制：
- * 1. 请求拦截器：自动附加 Authorization Bearer token
- * 2. 响应拦截器：检测 401 → 自动用 refreshToken 换取新 accessToken → 重试原请求
- *    如果刷新也失败，清除 token 并跳转登录页
- */
+export const apiBaseUrl =
+  import.meta.env.VITE_API_URL || (import.meta.env.DEV ? 'http://localhost:3000/api' : '/api');
+
 const api = axios.create({
-  baseURL: import.meta.env.VITE_API_URL || 'http://localhost:3000/api',
+  baseURL: apiBaseUrl,
   timeout: 10000,
   headers: { 'Content-Type': 'application/json' },
 });
 
-// 请求拦截器——每次请求自动带上 JWT accessToken
-api.interceptors.request.use((config) => {
+interface AuthRequest extends InternalAxiosRequestConfig {
+  sentRefreshToken?: string | null;
+  retried?: boolean;
+}
+
+const authEndpoints = new Set(['/auth/login', '/auth/register', '/auth/refresh', '/auth/logout']);
+let pendingRefresh: { token: string; promise: Promise<void> } | undefined;
+let lastRotation: { previous: string; current: string } | undefined;
+
+function refreshSession(token: string) {
+  if (pendingRefresh?.token === token) return pendingRefresh.promise;
+
+  const promise = axios
+    .post<{ data: { accessToken: string; refreshToken: string } }>(
+      `${apiBaseUrl}/auth/refresh`, { refreshToken: token }, { timeout: 10000 },
+    )
+    .then(({ data: { data: tokens } }) => {
+      if (localStorage.getItem('refreshToken') !== token) return;
+      localStorage.setItem('accessToken', tokens.accessToken);
+      localStorage.setItem('refreshToken', tokens.refreshToken);
+      lastRotation = { previous: token, current: tokens.refreshToken };
+    })
+    .catch((error) => {
+      if (axios.isAxiosError(error) && error.response?.status === 401 &&
+          localStorage.getItem('refreshToken') === token) {
+        useAuthStore.getState().logout();
+      }
+      throw error;
+    })
+    .finally(() => {
+      if (pendingRefresh?.promise === promise) pendingRefresh = undefined;
+    });
+  pendingRefresh = { token, promise };
+  return promise;
+}
+
+api.interceptors.request.use((config: AuthRequest) => {
+  if (authEndpoints.has(config.url ?? '')) return config;
+  config.sentRefreshToken = localStorage.getItem('refreshToken');
   const token = localStorage.getItem('accessToken');
-  if (token) {
-    config.headers.Authorization = `Bearer ${token}`;
-  }
+  if (token) config.headers.Authorization = `Bearer ${token}`;
   return config;
 });
 
-// 响应拦截器——处理 401 未授权错误
-// _retry 标记防止无限循环：如果刷新 token 的请求也返回 401，不再重试
 api.interceptors.response.use(
   (response) => response,
   async (error) => {
-    const original = error.config;
-    if (error.response?.status === 401 && !original._retry) {
-      original._retry = true;
-      try {
-        const refreshToken = localStorage.getItem('refreshToken');
-        const { data } = await axios.post(
-          `${import.meta.env.VITE_API_URL || 'http://localhost:3000/api'}/auth/refresh`,
-          { refreshToken },
-        );
-        // 后端返回 { data: { accessToken, refreshToken } }，所以取 data.data
-        const tokens = data.data || data;
-        localStorage.setItem('accessToken', tokens.accessToken);
-        localStorage.setItem('refreshToken', tokens.refreshToken); // 同时更新 refreshToken，防止滚动刷新后旧值失效
-        original.headers.Authorization = `Bearer ${tokens.accessToken}`;
-        return api(original);
-      } catch {
-        // 刷新也失败，清除所有 token 并跳转登录页
-        localStorage.removeItem('accessToken');
-        localStorage.removeItem('refreshToken');
-        window.location.href = '/login';
-      }
+    const original: AuthRequest | undefined = error.config;
+    if (error.response?.status !== 401 || !original || original.retried || !original.sentRefreshToken) {
+      throw error;
     }
-    return Promise.reject(error);
+
+    const sent = original.sentRefreshToken;
+    if (localStorage.getItem('refreshToken') === sent) await refreshSession(sent);
+    // 退出或切换账号后，旧请求不能用新会话重试。
+    if (lastRotation?.previous !== sent || lastRotation.current !== localStorage.getItem('refreshToken')) {
+      throw error;
+    }
+    original.retried = true;
+    return api(original);
   },
 );
 

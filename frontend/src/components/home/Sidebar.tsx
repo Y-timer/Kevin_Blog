@@ -42,9 +42,7 @@ export default function Sidebar({ onCategoryClick, activeCategoryId, onSearch }:
   });
 
   const handleSearch = () => {
-    if (onSearch && searchInput.trim()) {
-      onSearch(searchInput.trim());
-    }
+    onSearch?.(searchInput.trim());
   };
 
   return (
@@ -58,6 +56,8 @@ export default function Sidebar({ onCategoryClick, activeCategoryId, onSearch }:
           <div className="flex gap-2">
             <input
               type="text"
+              aria-label="搜索文章关键词"
+              maxLength={200}
               value={searchInput}
               onChange={(e) => setSearchInput(e.target.value)}
               onKeyDown={(e) => {

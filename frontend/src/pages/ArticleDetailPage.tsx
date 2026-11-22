@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useInfiniteQuery, useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { isAxiosError } from 'axios';
 import { useAuthStore } from '../store/authStore';
 import api from '../services/api';
 import ParticleBackground from '../components/layout/ParticleBackground';
@@ -11,7 +12,7 @@ import ArticleHeader from '../components/article/ArticleHeader';
 import CommentSection from '../components/article/CommentSection';
 import ArticleSidebar from '../components/article/ArticleSidebar';
 import { useReadingProgress } from '../hooks/useReadingProgress';
-import { getPostBySlug } from '../services/post';
+import { createComment, getComments, getPostBySlug, getPosts } from '../services/post';
 import MarkdownRenderer from '../components/article/MarkdownRenderer';
 import { extractToc } from '../utils/toc';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
@@ -26,14 +27,17 @@ export default function ArticleDetailPage() {
     data: post,
     isLoading,
     isError,
+    error,
+    refetch,
   } = useQuery({
     queryKey: ['post', slug],
     queryFn: () => getPostBySlug(slug!),
     enabled: !!slug,
     staleTime: 60 * 1000,
-    retry: 1,
+    retry: (count, error) => count < 1 && !(isAxiosError(error) && error.response?.status === 404),
     retryDelay: 1000,
   });
+  const notFound = isAxiosError(error) && error.response?.status === 404;
 
   useDocumentTitle(post?.title);
 
@@ -47,14 +51,11 @@ export default function ArticleDetailPage() {
   const { data: relatedPosts } = useQuery({
     queryKey: ['related', post?.categoryId || 'latest', post?.id],
     queryFn: async () => {
-      const params: any = { pageSize: 20 };
-      if (post?.categoryId) params.categoryId = post.categoryId;
-      const { data } = await api.get('/posts', { params });
-      const posts = Array.isArray(data?.data) ? data.data : (data?.data?.data || []);
+      const { data: posts } = await getPosts({ pageSize: 5, categoryId: post?.categoryId || undefined });
       return posts
-        .filter((p: any) => p.id !== post?.id)
+        .filter((p) => p.id !== post?.id)
         .slice(0, 4)
-        .map((p: any) => ({ title: p.title, href: `/post/${p.slug}` }));
+        .map((p) => ({ title: p.title, href: `/post/${p.slug}` }));
     },
     enabled: !!post?.id,
     retry: 2,
@@ -64,21 +65,24 @@ export default function ArticleDetailPage() {
   const { data: neighbors } = useQuery({
     queryKey: ['neighbors', slug],
     queryFn: () => api.get(`/posts/${slug}/neighbors`).then((r) => r.data.data),
-    enabled: !!slug,
+    enabled: !!post,
   });
 
   // 评论数据
   const qc = useQueryClient();
-  const { data: commentData } = useQuery({
+  const commentsQuery = useInfiniteQuery({
     queryKey: ['comments', post?.id],
-    queryFn: () => api.get(`/comments/post/${post!.id}`).then((r) => r.data.data || []),
+    queryFn: ({ pageParam, signal }) => getComments(post!.id, pageParam, signal),
+    initialPageParam: 1,
+    getNextPageParam: ({ pagination }) =>
+      pagination.page < pagination.totalPages ? pagination.page + 1 : undefined,
     enabled: !!post?.id,
   });
-  const postComments = commentData || [];
+  const postComments = commentsQuery.data?.pages.flatMap((page) => page.data) ?? [];
 
   const addCommentMut = useMutation({
     mutationFn: ({ content, parentId }: { content: string; parentId?: string }) =>
-      api.post(`/comments/post/${post!.id}`, { content, parentId }),
+      createComment(post!.id, content, parentId),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['comments', post?.id] }),
   });
 
@@ -146,13 +150,15 @@ export default function ArticleDetailPage() {
               {isLoading && <div className="py-20 text-center text-sm text-[#606078]">加载中...</div>}
               {isError && (
                 <div className="py-20 text-center">
-                  <p className="mb-3 text-sm text-[#ff2d95]">文章加载失败，请确认后端服务已启动</p>
-                  <button
-                    onClick={() => window.location.reload()}
-                    className="rounded-lg border border-[rgba(0,229,255,0.25)] px-5 py-2 text-sm text-[#00e5ff] transition-all hover:bg-[rgba(0,229,255,0.06)]"
-                  >
-                    重新加载
-                  </button>
+                  <p className="mb-3 text-sm text-[#ff2d95]">{notFound ? '文章不存在或尚未发布' : '文章加载失败'}</p>
+                  {!notFound && (
+                    <button
+                      onClick={() => void refetch()}
+                      className="rounded-lg border border-[rgba(0,229,255,0.25)] px-5 py-2 text-sm text-[#00e5ff]"
+                    >
+                      重新加载
+                    </button>
+                  )}
                 </div>
               )}
               {post && currentUser && currentUser.id === post.authorId && (
@@ -167,7 +173,7 @@ export default function ArticleDetailPage() {
               )}
               {post && (
                 <ArticleHeader
-                  category={post?.category?.name || 'AI & ML'}
+                  category={post.category?.name || '未分类'}
                   categoryClass="cat-ai"
                   title={post?.title || '加载中...'}
                   subtitle={post?.excerpt || ''}
@@ -226,22 +232,34 @@ export default function ArticleDetailPage() {
               </nav>
 
               {/* Comments */}
-              <CommentSection
-                comments={postComments}
-                isAuthenticated={!!currentUser}
-                currentUserId={currentUser?.id}
-                postAuthorId={post?.authorId}
-                onAdd={async (content, parentId) => {
-                  await addCommentMut.mutateAsync({ content, parentId: parentId || undefined });
-                }}
-                onDelete={async (commentId) => {
-                  await delCommentMut.mutateAsync(commentId);
-                }}
-              />
+              {post && (
+                <CommentSection
+                  key={post.id}
+                  comments={postComments}
+                  total={commentsQuery.data?.pages[0].pagination.total}
+                  loading={commentsQuery.isLoading}
+                  loadFailed={commentsQuery.isError && !commentsQuery.data}
+                  onRetry={() => void commentsQuery.refetch()}
+                  canLoadMore={commentsQuery.hasNextPage}
+                  loadingMore={commentsQuery.isFetching}
+                  loadMoreFailed={commentsQuery.isFetchNextPageError}
+                  onLoadMore={() => void commentsQuery.fetchNextPage()}
+                  isAuthenticated={!!currentUser}
+                  currentUserId={currentUser?.id}
+                  isAdmin={currentUser?.role === 'ADMIN'}
+                  postAuthorId={post.authorId}
+                  onAdd={async (content, parentId) => {
+                    await addCommentMut.mutateAsync({ content, parentId });
+                  }}
+                  onDelete={async (commentId) => {
+                    await delCommentMut.mutateAsync(commentId);
+                  }}
+                />
+              )}
             </div>
 
             {/* Sidebar */}
-            <ArticleSidebar
+            {post && <ArticleSidebar
               author={{
                 initials: post?.author?.username?.slice(0, 2).toUpperCase() || 'NX',
                 name: post?.author?.username || 'Nexus',
@@ -252,7 +270,7 @@ export default function ArticleDetailPage() {
               }}
               tocItems={post?.content ? extractToc(post.content) : []}
               relatedPosts={relatedPosts || []}
-            />
+            />}
           </div>
         </div>
       </main>

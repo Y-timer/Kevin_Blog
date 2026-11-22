@@ -25,7 +25,7 @@ export class AuthController {
   async refresh(req: Request, res: Response) {
     try {
       const { refreshToken } = req.body;
-      if (!refreshToken) {
+      if (typeof refreshToken !== 'string' || !refreshToken) {
         res.status(400).json({ message: '缺少刷新令牌' });
         return;
       }
@@ -96,22 +96,8 @@ export class AuthController {
     }
   }
 
-  async forgotPassword(req: Request, res: Response) {
-    try {
-      const result = await authService.forgotPassword(req.body.email);
-      res.json({ message: '重置链接已发送', data: result });
-    } catch (err: any) {
-      res.status(400).json({ message: err.message });
-    }
-  }
-
-  async resetPassword(req: Request, res: Response) {
-    try {
-      await authService.resetPassword(req.body.token, req.body.newPassword);
-      res.json({ message: '密码重置成功' });
-    } catch (err: any) {
-      res.status(400).json({ message: err.message });
-    }
+  passwordResetUnavailable(_req: Request, res: Response) {
+    res.status(503).json({ message: '暂未开通自助密码重置，请联系管理员' });
   }
 }
 

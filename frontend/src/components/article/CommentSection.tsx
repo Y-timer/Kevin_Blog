@@ -1,9 +1,19 @@
 import { useState } from 'react';
 import type { Comment } from '../../types';
+import { getApiErrorMessage } from '../../utils/errors';
 
 interface CommentSectionProps {
   comments: Comment[];
+  total?: number;
+  loading: boolean;
+  loadFailed: boolean;
+  onRetry: () => void;
+  canLoadMore: boolean;
+  loadingMore: boolean;
+  loadMoreFailed: boolean;
+  onLoadMore: () => void;
   isAuthenticated: boolean;
+  isAdmin: boolean;
   onAdd: (content: string, parentId?: string) => Promise<void>;
   onDelete: (commentId: string) => Promise<void>;
   currentUserId?: string;
@@ -22,10 +32,8 @@ function nestComments(all: Comment[]) {
   const top: Comment[] = [];
   const replies: Record<string, Comment[]> = {};
   all.forEach((c) => {
-    if ((c as any).parentId) {
-      const pid = (c as any).parentId;
-      if (!replies[pid]) replies[pid] = [];
-      replies[pid].push(c);
+    if (c.parentId) {
+      (replies[c.parentId] ??= []).push(c);
     } else {
       top.push(c);
     }
@@ -33,31 +41,54 @@ function nestComments(all: Comment[]) {
   return { top, replies };
 }
 
-function ReplyItem({ comment, i, onDelete, currentUserId, postAuthorId }: {
-  comment: Comment; i: number; onDelete: (id: string) => Promise<void>; currentUserId?: string; postAuthorId?: string;
-}) {
+function DeleteCommentButton({ id, onDelete }: { id: string; onDelete: (id: string) => Promise<void> }) {
   const [deleting, setDeleting] = useState(false);
+  const [error, setError] = useState('');
+
+  const handleDelete = async () => {
+    if (!window.confirm('确定删除这条评论？')) return;
+    setDeleting(true);
+    setError('');
+    try {
+      await onDelete(id);
+    } catch (cause) {
+      setError(getApiErrorMessage(cause, '删除评论失败，请重试'));
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  return (
+    <div className="text-right">
+      <button onClick={handleDelete} disabled={deleting} className="text-xs text-[#9090a8] hover:text-[#ff2d95]">
+        {deleting ? '删除中...' : '删除'}
+      </button>
+      {error && <p role="alert" className="text-xs text-[#ff2d95]">{error}</p>}
+    </div>
+  );
+}
+
+function ReplyItem({ comment, i, onDelete, canDelete, postAuthorId }: {
+  comment: Comment; i: number; onDelete: (id: string) => Promise<void>; canDelete: boolean; postAuthorId?: string;
+}) {
   return (
     <div className="relative mt-3 ml-12 rounded-lg border border-[rgba(255,255,255,0.06)] bg-[#111118] p-4">
       {/* 左边连接线装饰 */}
       <div className="absolute left-[-16px] top-[18px] h-3 w-3 rounded-bl border-b-2 border-l-2 border-[rgba(255,255,255,0.06)]" />
       <div className="mb-2 flex items-center gap-3">
         <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-[0.78rem] font-bold text-white ${avClasses[(i + 1) % avClasses.length]}`}>
-          {comment.user?.username?.slice(0, 2).toUpperCase() || 'U'}
+          {comment.author.username.slice(0, 2).toUpperCase()}
         </div>
         <div className="flex-1">
           <div className="flex items-center gap-1.5 text-[0.9rem] font-semibold text-text-primary">
-            {comment.user?.username || '用户'}
+            {comment.author.username}
             {comment.userId === postAuthorId && <span className="text-[0.7rem] text-accent-purple">作者</span>}
           </div>
           <div className="text-[0.76rem] text-text-muted font-(--font-mono)" style={{ fontFamily: 'var(--font-mono)' }}>
             {new Date(comment.createdAt).toLocaleString('zh-CN')}
           </div>
         </div>
-        {currentUserId === comment.userId && (
-          <button onClick={async () => { setDeleting(true); try { await onDelete(comment.id); } catch {} setDeleting(false); }}
-            disabled={deleting} className="text-xs text-[#606078] transition-colors hover:text-[#ff2d95]">{deleting ? '...' : '删除'}</button>
-        )}
+        {canDelete && <DeleteCommentButton id={comment.id} onDelete={onDelete} />}
       </div>
       <p className="text-[0.9rem] leading-[1.7] text-[#c0c0ce]">{comment.content}</p>
     </div>
@@ -65,23 +96,32 @@ function ReplyItem({ comment, i, onDelete, currentUserId, postAuthorId }: {
 }
 
 function CommentItem({
-  comment, i, replies, isAuthenticated, onAdd, onDelete, currentUserId, postAuthorId,
+  comment, i, replies, isAuthenticated, onAdd, onDelete, currentUserId, postAuthorId, isAdmin,
 }: {
   comment: Comment; i: number; replies?: Comment[]; isAuthenticated: boolean;
   onAdd: (content: string, parentId?: string) => Promise<void>; onDelete: (id: string) => Promise<void>;
-  currentUserId?: string; postAuthorId?: string;
+  currentUserId?: string; postAuthorId?: string; isAdmin: boolean;
 }) {
   const [showReply, setShowReply] = useState(false);
   const [replyContent, setReplyContent] = useState('');
   const [submitting, setSubmitting] = useState(false);
-  const [deleting, setDeleting] = useState(false);
+  const [replyError, setReplyError] = useState('');
   const [repliesOpen, setRepliesOpen] = useState(true); // 子回复展开/收起
 
   const handleReply = async () => {
     if (!replyContent.trim() || submitting) return;
     setSubmitting(true);
-    try { await onAdd(replyContent.trim(), comment.id); setReplyContent(''); setShowReply(false); setRepliesOpen(true); } catch {}
-    setSubmitting(false);
+    setReplyError('');
+    try {
+      await onAdd(replyContent.trim(), comment.id);
+      setReplyContent('');
+      setShowReply(false);
+      setRepliesOpen(true);
+    } catch (error) {
+      setReplyError(getApiErrorMessage(error, '回复失败，请重试'));
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   const replyCount = replies?.length || 0;
@@ -90,21 +130,18 @@ function CommentItem({
     <div className="card mb-4 px-6 py-5.5 transition-all duration-300 hover:border-[rgba(255,255,255,0.1)]">
       <div className="mb-3 flex items-center gap-3">
         <div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[0.82rem] font-bold text-white ${avClasses[i % avClasses.length]}`}>
-          {comment.user?.username?.slice(0, 2).toUpperCase() || 'U'}
+          {comment.author.username.slice(0, 2).toUpperCase()}
         </div>
         <div className="flex-1">
           <div className="flex items-center gap-1.5 text-[0.92rem] font-semibold text-text-primary">
-            {comment.user?.username || '用户'}
+            {comment.author.username}
             {comment.userId === postAuthorId && <span className="text-[0.7rem] text-accent-purple">作者</span>}
           </div>
           <div className="text-[0.78rem] text-text-muted font-(--font-mono)" style={{ fontFamily: 'var(--font-mono)' }}>
             {new Date(comment.createdAt).toLocaleString('zh-CN')}
           </div>
         </div>
-        {currentUserId === comment.userId && (
-          <button onClick={async () => { setDeleting(true); try { await onDelete(comment.id); } catch {} setDeleting(false); }}
-            disabled={deleting} className="text-xs text-[#606078] transition-colors hover:text-[#ff2d95]">{deleting ? '...' : '删除'}</button>
-        )}
+        {(isAdmin || currentUserId === comment.userId) && <DeleteCommentButton id={comment.id} onDelete={onDelete} />}
       </div>
       <p className="text-[0.92rem] leading-[1.7] text-[#c0c0ce]">{comment.content}</p>
 
@@ -125,8 +162,9 @@ function CommentItem({
       {/* Reply form */}
       {showReply && (
         <div className="mt-3">
-          <textarea value={replyContent} onChange={(e) => setReplyContent(e.target.value)} rows={2}
-            placeholder={`回复 ${comment.user?.username || '用户'}...`}
+          <textarea value={replyContent} onChange={(e) => setReplyContent(e.target.value)} rows={2} maxLength={5000}
+            aria-label={`回复 ${comment.author.username}`}
+            placeholder={`回复 ${comment.author.username}...`}
             className="w-full resize-none rounded-lg border border-[rgba(255,255,255,0.06)] bg-[#111118] px-4 py-2.5 text-sm text-[#e0e0e8] transition-all outline-none placeholder:text-[#606078] focus:border-[#00e5ff] focus:shadow-[0_0_16px_rgba(0,229,255,0.15)]" />
           <div className="mt-2 flex justify-end gap-2">
             <button onClick={() => setShowReply(false)} className="rounded-lg border border-[rgba(255,255,255,0.06)] bg-transparent px-4 py-1.5 text-xs text-[#9090a8] transition-all hover:border-[#00e5ff] hover:text-[#00e5ff]">取消</button>
@@ -135,6 +173,7 @@ function CommentItem({
               {submitting ? '提交中...' : '回复'}
             </button>
           </div>
+          {replyError && <p role="alert" className="text-xs text-[#ff2d95]">{replyError}</p>}
         </div>
       )}
 
@@ -142,7 +181,7 @@ function CommentItem({
       {repliesOpen && replyCount > 0 && (
         <div className="mt-1">
           {replies!.map((r, ri) => (
-            <ReplyItem key={r.id} comment={r} i={ri} onDelete={onDelete} currentUserId={currentUserId} postAuthorId={postAuthorId} />
+            <ReplyItem key={r.id} comment={r} i={ri} onDelete={onDelete} canDelete={isAdmin || currentUserId === r.userId} postAuthorId={postAuthorId} />
           ))}
         </div>
       )}
@@ -151,26 +190,36 @@ function CommentItem({
 }
 
 export default function CommentSection({
-  comments, isAuthenticated, onAdd, onDelete, currentUserId, postAuthorId,
+  comments, total, loading, loadFailed, onRetry, canLoadMore, loadingMore, loadMoreFailed, onLoadMore,
+  isAuthenticated, isAdmin, onAdd, onDelete, currentUserId, postAuthorId,
 }: CommentSectionProps) {
   const [content, setContent] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [submitFeedback, setSubmitFeedback] = useState<{ message: string; error: boolean }>();
   const { top, replies } = nestComments(comments);
 
   const handleSubmit = async () => {
     if (!content.trim() || submitting) return;
     setSubmitting(true);
-    try { await onAdd(content.trim()); setContent(''); } catch {}
-    setSubmitting(false);
+    setSubmitFeedback(undefined);
+    try {
+      await onAdd(content.trim());
+      setContent('');
+      setSubmitFeedback({ message: '评论已发表', error: false });
+    } catch (error) {
+      setSubmitFeedback({ message: getApiErrorMessage(error, '评论发表失败，请重试'), error: true });
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return (
     <section className="mb-12" id="comments">
-      <h2 className="mb-7 border-l-[3px] border-accent-cyan pl-4 text-[1.3rem] font-bold">评论 ({comments.length})</h2>
+      <h2 className="mb-7 border-l-[3px] border-accent-cyan pl-4 text-[1.3rem] font-bold">评论{total === undefined ? '' : ` (${total})`}</h2>
 
       {isAuthenticated && (
         <div className="card mb-5 p-5">
-          <textarea value={content} onChange={(e) => setContent(e.target.value)} rows={3}
+          <textarea value={content} onChange={(e) => setContent(e.target.value)} rows={3} maxLength={5000} aria-label="评论内容"
             placeholder="写下你的评论..."
             className="w-full resize-none rounded-lg border border-[rgba(255,255,255,0.06)] bg-[#111118] px-4 py-3 text-sm text-[#e0e0e8] transition-all outline-none placeholder:text-[#606078] focus:border-[#00e5ff] focus:shadow-[0_0_16px_rgba(0,229,255,0.15)]" />
           <div className="mt-3 flex justify-end">
@@ -179,15 +228,31 @@ export default function CommentSection({
               {submitting ? '提交中...' : '发表评论'}
             </button>
           </div>
+          {submitFeedback && (
+            <p role={submitFeedback.error ? 'alert' : 'status'} className={submitFeedback.error ? 'text-sm text-[#ff2d95]' : 'text-sm text-accent-cyan'}>
+              {submitFeedback.message}
+            </p>
+          )}
         </div>
       )}
 
-      {top.length === 0 && <p className="py-8 text-center text-sm text-[#606078]">暂无评论</p>}
+      {loading && <p role="status" className="py-8 text-center text-sm">正在加载评论…</p>}
+      {loadFailed && (
+        <p role="alert" className="py-8 text-center text-sm">
+          评论加载失败。<button className="text-accent-cyan" onClick={onRetry}>重试</button>
+        </p>
+      )}
+      {total === 0 && <p className="py-8 text-center text-sm text-[#9090a8]">暂无评论</p>}
 
       {top.map((comment, i) => (
         <CommentItem key={comment.id} comment={comment} i={i}
-          replies={replies[comment.id]} isAuthenticated={isAuthenticated} onAdd={onAdd} onDelete={onDelete} currentUserId={currentUserId} postAuthorId={postAuthorId} />
+          replies={replies[comment.id]} isAuthenticated={isAuthenticated} isAdmin={isAdmin} onAdd={onAdd} onDelete={onDelete} currentUserId={currentUserId} postAuthorId={postAuthorId} />
       ))}
+      {canLoadMore && (
+        <button onClick={onLoadMore} disabled={loadingMore} className="mx-auto block text-sm text-accent-cyan disabled:opacity-50">
+          {loadingMore ? '加载中…' : loadMoreFailed ? '加载失败，重试' : '加载更多评论'}
+        </button>
+      )}
     </section>
   );
 }

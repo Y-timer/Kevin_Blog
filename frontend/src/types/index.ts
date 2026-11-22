@@ -57,7 +57,8 @@ export interface Comment {
   content: string;
   postId: string;
   userId: string;
-  user?: User;
+  parentId: string | null;
+  author: Pick<User, 'id' | 'username' | 'avatar'>;
   createdAt: string;
 }
 
